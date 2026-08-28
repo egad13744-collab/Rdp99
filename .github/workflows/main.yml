@@ -1,0 +1,206 @@
+name: Tailscale-RDP
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: tailscale-rdp-${{ github.repository }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    env:
+      RDP_USERNAME: egandika
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      TAILSCALE_HOSTNAME: gh-rdp-${{ github.run_id }}
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          $terminalServerPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          $rdpTcpPath = "$terminalServerPath\WinStations\RDP-Tcp"
+
+          # Aktifkan RDP
+          Set-ItemProperty `
+            -Path $terminalServerPath `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          # Aktifkan Network Level Authentication
+          Set-ItemProperty `
+            -Path $rdpTcpPath `
+            -Name "UserAuthentication" `
+            -Value 1 `
+            -Force
+
+          # Nonaktifkan firewall rule RDP bawaan
+          Get-NetFirewallRule `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.DisplayGroup -eq "Remote Desktop"
+            } |
+            Disable-NetFirewallRule `
+            -ErrorAction SilentlyContinue
+
+          # RDP hanya boleh diakses dari jaringan Tailscale
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Restart-Service TermService -Force
+
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Secret RDP_PASSWORD belum dibuat."
+          }
+
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+            New-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -Description "Temporary RDP user"
+          } else {
+            Set-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installer = Join-Path `
+            $env:RUNNER_TEMP `
+            "tailscale-setup.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList @(
+              "/i",
+              $installer,
+              "/qn",
+              "/norestart"
+            ) `
+            -Wait `
+            -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            throw "Instalasi Tailscale gagal. Exit code: $($process.ExitCode)"
+          }
+
+      - name: Connect Tailscale
+        shell: pwsh
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+            throw "tailscale.exe tidak ditemukan."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Secret TAILSCALE_AUTH_KEY belum dibuat."
+          }
+
+          & $tailscale up `
+            "--auth-key=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=$env:TAILSCALE_HOSTNAME" `
+            "--accept-dns=false"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Gagal menghubungkan Tailscale."
+          }
+
+          $ip = (
+            & $tailscale ip -4 |
+            Select-Object -First 1
+          ).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw "IP Tailscale tidak ditemukan."
+          }
+
+          # Sembunyikan IP dari pemrosesan log berikutnya
+          Write-Output "::add-mask::$ip"
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "RDP SIAP DIGUNAKAN"
+          Write-Host "IP       : $ip"
+          Write-Host "Port     : 3389"
+          Write-Host "Username : $env:RDP_USERNAME"
+          Write-Host "Password : gunakan secret RDP_PASSWORD"
+          Write-Host "======================================"
+          Write-Host ""
+
+      - name: Keep runner alive
+        shell: pwsh
+        run: |
+          # 330 menit, menyisakan waktu sebelum timeout job 350 menit
+          $endTime = (Get-Date).AddMinutes(330)
+
+          while ((Get-Date) -lt $endTime) {
+            $remaining = [math]::Ceiling(
+              ($endTime - (Get-Date)).TotalMinutes
+            )
+
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]"
+            Write-Host "RDP masih aktif. Sisa waktu sekitar $remaining menit."
+
+            Start-Sleep -Seconds 300
+          }
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (Test-Path $tailscale) {
+            & $tailscale logout
+          }
+
+          Remove-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -ErrorAction SilentlyContinue
+
+          Remove-LocalUser `
+            -Name $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Cleanup selesai."
